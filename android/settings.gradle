@@ -1,0 +1,2 @@
+rootProject.name = "raylib-d-android"
+include ":app"

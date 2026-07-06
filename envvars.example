@@ -1,0 +1,5 @@
+export LDC_ANDROID_AARCH64_HOME=/home/user/ldc2-aarch64
+export ANDROID_NDK_HOME=/opt/android-ndk
+export RAYLIB_LIB_DIR=/home/user/raylib-android/
+
+

@@ -1,0 +1,36 @@
+{
+	"name": "raylib-d-android",
+	"description": "raylib-d app buildable for desktop and Android",
+	"authors": ["ItsZariep"],
+	"copyright": "Copyright © 2026",
+	"license": "MIT",
+	"targetType": "executable",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+
+	"dependencies": {
+		"raylib-d": "~>6.0.1"
+	},
+
+	"configurations": [
+		{
+			"name": "desktop",
+			"targetType": "executable",
+				"libs": [
+				"raylib"
+			],
+		},
+		{
+			"name": "android",
+			"targetType": "dynamicLibrary",
+			"targetName": "main",
+			"dependencies": {
+				"raylib-d": "~>6.0.1"
+			},
+			"subConfigurations": {
+				"raylib-d": "library"
+			},
+			"libs-posix": []
+		}
+	]
+}

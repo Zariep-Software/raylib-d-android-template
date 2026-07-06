@@ -1,0 +1,33 @@
+apply plugin: 'com.android.application'
+
+android {
+	namespace 'com.example.raylibd'
+	compileSdk 34
+
+	defaultConfig {
+		applicationId "com.example.raylibd"
+		minSdk 24
+		targetSdk 34
+		versionCode 1
+		versionName "1.0"
+	}
+
+	// The .so files (libmain.so, libraylib.so, etc.)
+	sourceSets {
+		main {
+			jniLibs.srcDirs = ['src/main/jniLibs']
+		}
+	}
+
+	packagingOptions {
+		jniLibs {
+			useLegacyPackaging = true
+		}
+	}
+
+	buildTypes {
+		release {
+			minifyEnabled false
+		}
+	}
+}
