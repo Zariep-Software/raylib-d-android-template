@@ -10,8 +10,31 @@ set -euo pipefail
 : "${EXTRA_CFLAGS:=}"
 : "${EXTRA_LDFLAGS:=}"
 
-declare -F android_pre_build >/dev/null || android_pre_build() { :; }
-declare -F android_post_build >/dev/null || android_post_build() { :; }
+# Optional standalone hook scripts
+# Silently skipped if missing. If present but not executable, we warn and skip.
+run_hook() {
+	local script="$1"; shift
+	if [ ! -f "$script" ]; then
+		return 0
+	fi
+	if [ ! -x "$script" ]; then
+		echo "== Skipping $script (found but not executable; run: chmod +x $script)" >&2
+		return 0
+	fi
+
+	echo "== Running $script $*" >&2
+
+	local line
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		echo "   [$script] $line" >&2
+		case "$line" in
+			EXTRA_CFLAGS=*)  EXTRA_CFLAGS="${EXTRA_CFLAGS} ${line#EXTRA_CFLAGS=}" ;;
+			EXTRA_LDFLAGS=*) EXTRA_LDFLAGS="${EXTRA_LDFLAGS} ${line#EXTRA_LDFLAGS=}" ;;
+			EXTRA_DFLAGS=*)  EXTRA_DFLAGS="${EXTRA_DFLAGS} ${line#EXTRA_DFLAGS=}" ;;
+		esac
+	done < <("./$script" "$@")
+}
 
 ABI="${1:-arm64-v8a}"
 API_LEVEL=24
@@ -111,12 +134,9 @@ SYSROOT="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/sysroot"
 # Force DUB to use NDK tools directly for everything
 export CC="${NDK_CLANG}"
 
-android_pre_build \
-"$ABI" \
-"$LDC_TRIPLE" \
-"$API_LEVEL" \
-"$SYSROOT" \
-"$OUT_DIR"
+# Optional pre-build hook: aprebuild.sh <abi> <triple> <apiLevel> <sysroot> <outDir>
+run_hook "aprebuild.sh" \
+	"$ABI" "$LDC_TRIPLE" "$API_LEVEL" "$SYSROOT" "$OUT_DIR"
 
 # -Wl,--wrap=fopen to satisfy Raylib's internal Android asset loader mapping.
 DFLAGS="-conf=${TMP_CONF} ${BETTERC_FLAG} \
@@ -163,6 +183,7 @@ fi
 
 ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/llvm-strip --strip-unneeded "${OUT_DIR}/libmain.so"
 
-android_post_build "${OUT_DIR}/libmain.so"
+# Optional post-build hook: apostbuild.sh <pathToStrippedLib>
+run_hook "apostbuild.sh" "${OUT_DIR}/libmain.so"
 
 echo "Now run: cd android && ./gradlew assembleDebug"
