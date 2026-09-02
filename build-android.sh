@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 
-if [ -f "./envvars.sh" ]; then
-	source "./envvars.sh"
+if [ -f "./asetup.sh" ]; then
+	source "./asetup.sh"
 fi
 
 set -euo pipefail
+
+: "${EXTRA_DFLAGS:=}"
+: "${EXTRA_CFLAGS:=}"
+: "${EXTRA_LDFLAGS:=}"
+
+declare -F android_pre_build >/dev/null || android_pre_build() { :; }
+declare -F android_post_build >/dev/null || android_post_build() { :; }
 
 ABI="${1:-arm64-v8a}"
 API_LEVEL=24
@@ -104,14 +111,22 @@ SYSROOT="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/sysroot"
 # Force DUB to use NDK tools directly for everything
 export CC="${NDK_CLANG}"
 
+android_pre_build \
+"$ABI" \
+"$LDC_TRIPLE" \
+"$API_LEVEL" \
+"$SYSROOT" \
+"$OUT_DIR"
+
 # -Wl,--wrap=fopen to satisfy Raylib's internal Android asset loader mapping.
-DFLAGS="-conf=${TMP_CONF} ${BETTERC_FLAG} -gcc=${NDK_CLANG} \
+DFLAGS="-conf=${TMP_CONF} ${BETTERC_FLAG} \
+-gcc=${NDK_CLANG} \
 -Xcc=--target=${LDC_TRIPLE}${API_LEVEL} \
 -Xcc=--sysroot=${SYSROOT} \
 -Xcc=-shared \
 -Xcc=-Wl,--wrap=fopen \
 -Xcc=-Wl,-u,ANativeActivity_onCreate \
--v \
+
 -L--sysroot=${SYSROOT} \
 -L-L${RAYLIB_LIB_DIR}/${ABI} \
 -L-lraylib \
@@ -120,14 +135,15 @@ DFLAGS="-conf=${TMP_CONF} ${BETTERC_FLAG} -gcc=${NDK_CLANG} \
 -L-landroid \
 -L-llog \
 -L-lc \
--L-L${SYSROOT}/usr/lib/${LDC_TRIPLE}/${API_LEVEL}" \
+-L-L${SYSROOT}/usr/lib/${LDC_TRIPLE}/${API_LEVEL} \
+${EXTRA_CFLAGS} \
+${EXTRA_LDFLAGS} \
+${EXTRA_DFLAGS}" \
 dub build -v \
 	--config=android \
 	--compiler=ldc2 \
 	--arch="${LDC_TRIPLE}" \
 	--force
-
-
 
 BUILT_LIB="libmain.so"
 
@@ -146,5 +162,7 @@ else
 fi
 
 ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/llvm-strip --strip-unneeded "${OUT_DIR}/libmain.so"
+
+android_post_build "${OUT_DIR}/libmain.so"
 
 echo "Now run: cd android && ./gradlew assembleDebug"

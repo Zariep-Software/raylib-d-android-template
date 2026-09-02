@@ -1,6 +1,8 @@
 *.so
+*.o
 *.a
 libs/
+raylib-d-android
 
 .gradle/
 android/.gradle/
