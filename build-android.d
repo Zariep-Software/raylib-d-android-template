@@ -114,14 +114,32 @@ void loadEnvFile(string path)
 	}
 }
 
+string ldcPackageHome(string pkgDir, string legacyVar)
+{
+	auto root = environment.get("LDC_ANDROID_HOME");
+	if (root is null || root.length == 0)
+	{
+		root = requireEnv(legacyVar,
+			"parent dir containing '" ~ pkgDir ~ "/', or set LDC_ANDROID_HOME");
+	}
+	return buildPath(root, pkgDir);
+}
+
+// ELF e_machine values
+private enum EM_ARM = 40;
+private enum EM_X86_64 = 62;
+private enum EM_AARCH64 = 183;
+
 // ABI configuration
 struct AbiConfig
 {
 	string abi; // canonical Android ABI name
 	string triple; // LDC target triple
+	string sysrootLibTriple; // dir name under <sysroot>/usr/lib (differs from triple on armv7)
 	string clangName; // NDK clang wrapper filename (without dir)
 	string runtimeLibDir;
 	bool is64Bit;
+	ushort elfMachine; // expected e_machine of objects for this ABI
 }
 
 AbiConfig resolveAbi(string requested, int apiLevel)
@@ -129,48 +147,99 @@ AbiConfig resolveAbi(string requested, int apiLevel)
 	switch (requested)
 	{
 		case "arm64-v8a":
+		case "armv8":
 		case "aarch64":
 		case "arm64":
 		{
-			auto home = requireEnv("LDC_ANDROID_AARCH64_HOME",
-				"your extracted ldc2-*-android-aarch64 package");
+			auto home = ldcPackageHome("arm64-v8a", "LDC_ANDROID_AARCH64_HOME");
 			return AbiConfig(
 				"arm64-v8a",
 				"aarch64-linux-android",
+				"aarch64-linux-android",
 				"aarch64-linux-android" ~ apiLevel.to!string ~ "-clang",
 				buildPath(home, "lib"),
-				true
+				true,
+				EM_AARCH64
 			);
 		}
 		case "x86_64":
 		case "amd64":
 		{
-			auto home = requireEnv("LDC_ANDROID_AARCH64_HOME",
-				"your extracted ldc2-*-android-aarch64 package");
+			// x86_64 runtime libs ship inside the aarch64 package (lib-android-x86_64),
+			// which lives in the arm64-v8a folder.
+			auto home = ldcPackageHome("arm64-v8a", "LDC_ANDROID_AARCH64_HOME");
 			return AbiConfig(
 				"x86_64",
 				"x86_64-linux-android",
+				"x86_64-linux-android",
 				"x86_64-linux-android" ~ apiLevel.to!string ~ "-clang",
 				buildPath(home, "lib-android-x86_64"),
-				true
+				true,
+				EM_X86_64
 			);
 		}
 		case "armeabi-v7a":
+		case "armv7":
 		case "arm":
 		case "arm32":
 		{
-			auto home = requireEnv("LDC_ANDROID_ARMV7A_HOME",
-				"your extracted ldc2-*-android-armv7a package");
+			auto home = ldcPackageHome("armeabi-v7a", "LDC_ANDROID_ARMV7A_HOME");
 			return AbiConfig(
 				"armeabi-v7a",
 				"armv7a-linux-androideabi",
+				// NDK sysroot uses "arm-linux-androideabi" instead of armv7a
+				"arm-linux-androideabi",
 				"armv7a-linux-androideabi" ~ apiLevel.to!string ~ "-clang",
 				buildPath(home, "lib"),
-				false
+				false,
+				EM_ARM
 			);
 		}
 		default:
 			throw new Exception("Unsupported ABI: " ~ requested);
+	}
+}
+
+string machineName(ushort m)
+{
+	switch (m)
+	{
+		case EM_ARM:     return "ARM (32-bit)";
+		case EM_AARCH64: return "AArch64";
+		case EM_X86_64:  return "x86-64";
+		default:         return "unknown (e_machine=" ~ m.to!string ~ ")";
+	}
+}
+
+ushort elfMachine(string path)
+{
+	auto f = File(path, "rb");
+	ubyte[20] hdr;
+	auto got = f.rawRead(hdr[]);
+	enforce(got.length == 20 && hdr[0] == 0x7f && hdr[1] == 'E'
+		&& hdr[2] == 'L' && hdr[3] == 'F', "Not a valid ELF file: " ~ path);
+	return hdr[].peek!(ushort, Endian.littleEndian)(0x12); // e_machine
+}
+
+// Catches the cause of "incompatible with elf64-x86-64": an extra object
+// (e.g. from aprebuild.sh) compiled for the wrong architecture. Only plain .o
+// files are checked.
+void checkObjectArch(string flags, AbiConfig cfg)
+{
+	foreach (tok; flags.split)
+	{
+		auto p = tok.startsWith("-L") ? tok[2 .. $] : tok;
+		if (!p.endsWith(".o"))
+			continue;
+		if (!exists(p) || !isFile(p))
+			throw new Exception("Extra object not found: " ~ p);
+
+		auto m = elfMachine(p);
+		enforce(m == cfg.elfMachine,
+			p ~ " is built for " ~ machineName(m) ~ " but target " ~ cfg.abi ~
+			" needs " ~ machineName(cfg.elfMachine) ~
+			". Fix aprebuild.sh to compile it with $NDK_CLANG.");
+		writeln("   ok: ", p, " is ", machineName(m));
 	}
 }
 
@@ -179,9 +248,9 @@ AbiConfig resolveAbi(string requested, int apiLevel)
 
 	Method: locate PT_DYNAMIC, walk its Elf{32,64}_Dyn entries, and for
 	any DT_RPATH (15) / DT_RUNPATH (29) tag, overwrite the tag with DT_NULL
-	(0) in place. This is a no-shrink, no-relink patch — exactly what
-	`patchelf --remove-rpath` does under the hood for the common case where
-	no other tags need to move. Handles both 32-bit and 64-bit ELF.
+	(0) in place. This is a no-shrink, no-relink patch, exactly what
+	`patchelf --remove-rpath` does for the common case where no other tags
+	need to move. Handles both 32-bit and 64-bit ELF.
 */
 
 private enum PT_DYNAMIC = 2;
@@ -200,97 +269,60 @@ void stripRpath(string path)
 
 	enforce(littleEndian, "Only little-endian ELF is supported (Android targets)");
 
+	enum LE = Endian.littleEndian;
+
+	// Elf64_Ehdr: e_phoff 0x20 (8), e_phentsize 0x36 (2), e_phnum 0x38 (2)
+	// Elf32_Ehdr: e_phoff 0x1C (4), e_phentsize 0x2A (2), e_phnum 0x2C (2)
+	size_t phoff = is64 ? cast(size_t) data.peek!(ulong, LE)(0x20) : data.peek!(uint, LE)(0x1C);
+	size_t phentsize = data.peek!(ushort, LE)(is64 ? 0x36 : 0x2A);
+	size_t phnum = data.peek!(ushort, LE)(is64 ? 0x38 : 0x2C);
+
+	// Elf64_Dyn = 16 bytes {Sxword tag; Xword val}, Elf32_Dyn = 8 bytes {Sword tag; Word val}
+	size_t entrySize = is64 ? 16 : 8;
 	size_t patched = 0;
 
-	if (is64)
+	foreach (i; 0 .. phnum)
 	{
-		// Elf64_Ehdr layout: e_phoff at offset 0x20 (8 bytes),
-		// e_phentsize at 0x36 (2 bytes), e_phnum at 0x38 (2 bytes)
-		ulong phoff = data.peek!(ulong, Endian.littleEndian)(0x20);
-		ushort phentsize = data.peek!(ushort, Endian.littleEndian)(0x36);
-		ushort phnum = data.peek!(ushort, Endian.littleEndian)(0x38);
+		size_t ph = phoff + i * phentsize;
+		if (data.peek!(uint, LE)(ph) != PT_DYNAMIC)
+			continue;
 
-		foreach (i; 0 .. phnum)
+		// 64-bit: p_offset at +8, p_filesz at +32. 32-bit: p_offset at +4, p_filesz at +16.
+		size_t dynOffset = is64 ? cast(size_t) data.peek!(ulong, LE)(ph + 8) : data.peek!(uint, LE)(ph + 4);
+		size_t dynFilesz = is64 ? cast(size_t) data.peek!(ulong, LE)(ph + 32) : data.peek!(uint, LE)(ph + 16);
+
+		// Copy every entry except RPATH/RUNPATH, up to and including DT_NULL.
+		// The table must be COMPACTED: the loader stops at the first DT_NULL, so
+		// blanking an entry in the middle hides everything after it
+		// (DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, ...).
+		ubyte[] kept;
+		size_t removed = 0;
+
+		foreach (j; 0 .. dynFilesz / entrySize)
 		{
-			size_t phOff = cast(size_t)(phoff + i * phentsize);
-			uint pType = data.peek!(uint, Endian.littleEndian)(phOff);
-			if (pType != PT_DYNAMIC)
+			size_t off = dynOffset + j * entrySize;
+			long tag = is64
+				? cast(long) data.peek!(ulong, LE)(off)
+				: cast(long) cast(int) data.peek!(uint, LE)(off);
+
+			if (tag == DT_RPATH || tag == DT_RUNPATH)
+			{
+				removed++;
 				continue;
-
-			ulong dynOffset = data.peek!(ulong, Endian.littleEndian)(phOff + 8); // p_offset
-			ulong dynFilesz = data.peek!(ulong, Endian.littleEndian)(phOff + 32); // p_filesz
-
-			// Elf64_Dyn { Elf64_Sxword d_tag; Elf64_Xword d_val; } = 16 bytes
-			size_t entrySize = 16;
-			size_t count = cast(size_t)(dynFilesz / entrySize);
-			size_t removed = 0;
-			ubyte[] entries;
-
-			foreach (j; 0 .. count)
-			{
-				size_t off = cast(size_t)(dynOffset + j * entrySize);
-				long tag = cast(long) data.peek!(ulong, Endian.littleEndian)(off);
-
-				if (tag == DT_RPATH || tag == DT_RUNPATH)
-				{
-					removed++;
-					continue;
-				}
-
-				entries ~= data[off .. off + entrySize];
-
-				if (tag == DT_NULL)
-					break;
 			}
 
-			if (removed > 0)
-			{
-				size_t writeOff = cast(size_t) dynOffset;
-				data[writeOff .. writeOff + entries.length] = entries[];
+			kept ~= data[off .. off + entrySize];
 
-				size_t padStart = writeOff + entries.length;
-				size_t padEnd = cast(size_t)(dynOffset + dynFilesz);
-				data[padStart .. padEnd] = 0; // DT_NULL (tag 0) + val 0, repeated
-				patched += removed;
-			}
+			if (tag == DT_NULL)
+				break;
 		}
-	}
-	else
-	{
-		// Elf32_Ehdr layout: e_phoff at offset 0x1C (4 bytes),
-		// e_phentsize at 0x2A (2 bytes), e_phnum at 0x2C (2 bytes)
-		uint phoff = data.peek!(uint, Endian.littleEndian)(0x1C);
-		ushort phentsize = data.peek!(ushort, Endian.littleEndian)(0x2A);
-		ushort phnum = data.peek!(ushort, Endian.littleEndian)(0x2C);
 
-		foreach (i; 0 .. phnum)
+		if (removed > 0)
 		{
-			size_t phOff = cast(size_t)(phoff + i * phentsize);
-			uint pType = data.peek!(uint, Endian.littleEndian)(phOff);
-			if (pType != PT_DYNAMIC)
-				continue;
-
-			uint dynOffset = data.peek!(uint, Endian.littleEndian)(phOff + 4); // p_offset
-			uint dynFilesz = data.peek!(uint, Endian.littleEndian)(phOff + 16); // p_filesz
-
-			// Elf32_Dyn { Elf32_Sword d_tag; Elf32_Word d_val; } = 8 bytes
-			size_t entrySize = 8;
-			size_t count = dynFilesz / entrySize;
-
-			foreach (j; 0 .. count)
-			{
-				size_t off = dynOffset + j * entrySize;
-				int tag = cast(int) data.peek!(uint, Endian.littleEndian)(off);
-				if (tag == DT_RPATH || tag == DT_RUNPATH)
-				{
-					data.write!(uint, Endian.littleEndian)(DT_NULL, off);
-					patched++;
-				}
-				else if (tag == DT_NULL)
-				{
-					break;
-				}
-			}
+			data[dynOffset .. dynOffset + kept.length] = kept[];
+			// Zero the tail: DT_NULL (tag 0) + val 0, repeated
+			data[dynOffset + kept.length .. dynOffset + dynFilesz] = 0;
+			patched += removed;
 		}
 	}
 
@@ -337,6 +369,9 @@ void runWithExtraEnv(string[] cmd, string[string] extraEnv)
 	just executed as a normal subprocess). If the file doesn't exist, the
 	hook is silently skipped. If it exists but isn't executable, we warn
 	and skip (so a stray non-executable file doesn't kill the build).
+
+	Stdout lines of the form EXTRA_CFLAGS=..., EXTRA_LDFLAGS=... and
+	EXTRA_DFLAGS=... are collected and appended to the matching flag sets.
 */
 
 struct HookResult
@@ -412,7 +447,7 @@ void main(string[] args)
 	loadEnvFile("./asetup.sh");
 
 	string requestedAbi = args.length > 1 ? args[1] : "arm64-v8a";
-	enum apiLevel = 24;
+	enum apiLevel = 29; // Older android fails with errors (See README.md)
 	enum betterCFlag = "-betterC"; // TODO: revisit when druntime/Phobos on Android is usable
 
 	auto ndkHome = requireEnv("ANDROID_NDK_HOME",
@@ -423,9 +458,12 @@ void main(string[] args)
 	auto toolchainBin = buildPath(ndkHome, "toolchains", "llvm", "prebuilt", hostTag, "bin");
 	auto ndkClang = buildPath(toolchainBin, abiCfg.clangName);
 	auto sysroot = buildPath(ndkHome, "toolchains", "llvm", "prebuilt", hostTag, "sysroot");
+	auto sysrootApiLibDir = buildPath(sysroot, "usr", "lib", abiCfg.sysrootLibTriple, apiLevel.to!string);
 
 	enforce(exists(ndkClang) && isFile(ndkClang),
 		"Expected NDK clang wrapper not found: " ~ ndkClang);
+	enforce(exists(sysrootApiLibDir) && isDir(sysrootApiLibDir),
+		"Expected NDK sysroot lib dir not found: " ~ sysrootApiLibDir);
 	enforce(exists(abiCfg.runtimeLibDir) && isDir(abiCfg.runtimeLibDir),
 		"Expected android runtime lib dir not found: " ~ abiCfg.runtimeLibDir ~
 		"\nList the package's contents to find the right folder name.");
@@ -469,6 +507,7 @@ void main(string[] args)
 	writeln("== Building D sources for ", abiCfg.abi, " (", abiCfg.triple,
 		", API ", apiLevel, ") ==");
 	writeln(" using runtime libs from: ", abiCfg.runtimeLibDir);
+	writeln(" using sysroot libs from: ", sysrootApiLibDir);
 
 	auto raylibLibDir = requireEnv("RAYLIB_LIB_DIR");
 	auto extraCFlags = envOr("EXTRA_CFLAGS", "");
@@ -494,16 +533,29 @@ void main(string[] args)
 	extraLdFlags = appendFlag(extraLdFlags, preHook.extraLdFlags);
 	extraDFlags = appendFlag(extraDFlags, preHook.extraDFlags);
 
+	// Fail early (with a clear message) if any extra .o has the wrong architecture.
+	checkObjectArch(extraDFlags, abiCfg);
+	checkObjectArch(extraLdFlags, abiCfg);
+
+	// VERBOSE_LINK=1 makes the clang link driver print its full lld command line,
+	// which shows exactly which -m emulation / --target it ends up using.
+	auto verboseLink = envOr("VERBOSE_LINK", "") == "1" ? "-Xcc=-v" : "";
+
 	// -Wl,--wrap=fopen satisfies Raylib's internal Android asset loader mapping
 	auto dflags = [
 		"-conf=" ~ tmpConf,
 		betterCFlag,
+		// API level in the triple lets LLVM pick emulated TLS (native ELF TLS in
+		// dlopen'd libs only works on Android 10+ / API 29+).
+		"-mtriple=" ~ abiCfg.triple ~ apiLevel.to!string,
 		"-gcc=" ~ ndkClang,
 		"-Xcc=--target=" ~ abiCfg.triple ~ apiLevel.to!string,
 		"-Xcc=--sysroot=" ~ sysroot,
+		"-Xcc=-fuse-ld=lld",
 		"-Xcc=-shared",
 		"-Xcc=-Wl,--wrap=fopen",
 		"-Xcc=-Wl,-u,ANativeActivity_onCreate",
+		verboseLink,
 		"-L--sysroot=" ~ sysroot,
 		"-L-L" ~ buildPath(raylibLibDir, abiCfg.abi),
 		"-L-lraylib",
@@ -512,7 +564,7 @@ void main(string[] args)
 		"-L-landroid",
 		"-L-llog",
 		"-L-lc",
-		"-L-L" ~ buildPath(sysroot, "usr", "lib", abiCfg.triple, apiLevel.to!string),
+		"-L-L" ~ sysrootApiLibDir,
 		extraCFlags,
 		extraLdFlags,
 		extraDFlags,
@@ -546,6 +598,11 @@ void main(string[] args)
 	std.file.copy(builtLib, destLib);
 	writeln("Copied ", builtLib, " -> ", outDir);
 
+	auto builtMachine = elfMachine(destLib);
+	enforce(builtMachine == abiCfg.elfMachine,
+		destLib ~ " is " ~ machineName(builtMachine) ~ ", expected " ~ machineName(abiCfg.elfMachine) ~
+		" -- libmain.so in the project root is probably stale from another ABI.");
+
 	stripRpath(destLib);
 
 	auto llvmStrip = buildPath(toolchainBin, "llvm-strip");
@@ -557,5 +614,5 @@ void main(string[] args)
 	// since the build already ran; only its side effects and exit status matter.
 	runHook("apostbuild.sh", [destLib], ["OUT_DIR": outDir, "ABI": abiCfg.abi]);
 
-	writeln("Now run: cd android && ./gradlew assembleDebug");
+	writefln("DONE: \"\033[32m%s\033[0m\"", destLib);
 }

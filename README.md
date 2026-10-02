@@ -15,6 +15,14 @@ This is a template for building a raylib-d game for android, please note that th
 > [!NOTE]
 > ldc2-aarch64 includes the x86_64 libs, so is still needed for x86_64
 
+> [!NOTE]
+> armv7 is not properly tested since i don't have an armv7 android 10+ device (see below) 
+
+## Android requirements
+
+- Android 10 or higher
+  - It may probably run on older devices, but LDC builds and expects `native thread-local storage`, so runtime crash with `unknown reloc type 17 @ 0x9c436c64 (531)`, and even assigning __gshared to everything, not even the simplest example runs, failing with `dlopen failed: cannot locate symbol "pthread_attr_setinheritsched"` (Android 9+).
+
 ## Considerations
 This template currently assumes a `-betterC`-style build.
 
